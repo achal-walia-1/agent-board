@@ -1,0 +1,16 @@
+#!/bin/bash
+# Codex allows a single `notify` program, so this fans out to both Agent Board and whatever
+# notify program Codex had before (saved by agent-board-setup). Codex appends the event JSON
+# as the final argument.
+json="${@: -1}"
+PREV="$HOME/.agent-board/codex-previous-notify.json"
+if [ -f "$PREV" ]; then
+  /usr/bin/python3 - "$PREV" "$json" <<'PY' &
+import json, subprocess, sys
+prev = json.load(open(sys.argv[1]))
+if prev:
+    subprocess.run(prev + [sys.argv[2]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+PY
+fi
+"$HOME/.agent-board/bin/agent-board-event" codex done "$json" >/dev/null 2>&1
+wait

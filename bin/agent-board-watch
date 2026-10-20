@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""Follow Codex session logs and feed Agent Board.
+
+The Codex desktop app doesn't run the `notify` program, but every Codex thread
+(desktop app and CLI) writes a live log to ~/.codex/sessions/YYYY/MM/DD/*.jsonl
+with task_started / user message / task_complete events. This tails those logs.
+
+  agent-board-watch            run forever (launchd)
+  agent-board-watch --dry 24   print what the last 24h of logs would produce
+"""
+import glob
+import importlib.machinery
+import json
+import os
+import re
+import sqlite3
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+SESSIONS = os.path.join(HOME, ".codex/sessions")
+STATE_DB = os.path.join(HOME, ".codex/state_5.sqlite")
+LOOKBACK = 6 * 3600          # only watch logs touched in the last 6h
+BACKFILL_RECENT = 3 * 3600   # on first sight, only surface turns from the last 3h
+
+event_mod = importlib.machinery.SourceFileLoader(
+    "agent_board_event", os.path.join(os.path.dirname(os.path.realpath(__file__)), "agent-board-event")
+).load_module()
+UUID = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$")
+
+
+def ts_of(entry):
+    try:
+        return time.mktime(time.strptime(entry["timestamp"][:19], "%Y-%m-%dT%H:%M:%S")) - time.timezone
+    except (KeyError, ValueError):
+        return time.time()
+
+
+def user_text(payload):
+    parts = payload.get("content") or []
+    text = " ".join(p.get("text", "") for p in parts if isinstance(p, dict) and p.get("type") in ("input_text", "text"))
+    if "## My request:" in text:
+        text = text.split("## My request:", 1)[1]
+    text = text.strip()
+    if not text or text.startswith("<") or text.startswith("# AGENTS") or text.startswith("# Files"):
+        return ""
+    return text
+
+
+def thread_names(ids):
+    """Codex keeps a short name per thread ("Design pro-style court overlays")."""
+    if not ids:
+        return {}
+    try:
+        con = sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True, timeout=1)
+        q = "select id, coalesce(nullif(name,''), title) from threads where id in (%s)" % ",".join("?" * len(ids))
+        rows = dict(con.execute(q, list(ids)).fetchall())
+        con.close()
+        return {k: v for k, v in rows.items() if v and len(v) < 120}
+    except sqlite3.Error:
+        return {}
+
+
+class Tail:
+    def __init__(self, path):
+        self.path = path
+        self.offset = 0
+        self.buf = ""
+        m = UUID.search(path)
+        self.thread = m.group(1) if m else os.path.basename(path)
+        self.cwd = ""
+        self.name = None
+
+    def read(self):
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(self.offset)
+                data = f.read()
+                self.offset = f.tell()
+        except OSError:
+            return []
+        self.buf += data.decode("utf-8", "ignore")
+        *lines, self.buf = self.buf.split("\n")
+        out = []
+        for line in lines:
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                pass
+        return out
+
+    def events(self, entries):
+        """Turn raw log entries into (event, update) pairs for agent-board-event.apply."""
+        for e in entries:
+            p = e.get("payload") or {}
+            kind, ptype = e.get("type"), p.get("type", "")
+            if kind in ("session_meta", "turn_context") and p.get("cwd"):
+                self.cwd = p["cwd"]
+                continue
+            base = {"id": "codex:" + self.thread, "thread": self.thread, "cwd": self.cwd, "ts": ts_of(e)}
+            if kind == "event_msg" and ptype == "task_started":
+                yield "start", base
+            elif kind == "response_item" and ptype == "message" and p.get("role") == "user":
+                text = user_text(p)
+                if text:
+                    yield "prompt", dict(base, prompt=event_mod.clean(text))
+            elif kind == "event_msg" and ptype == "task_complete":
+                yield "done", dict(base, reply=event_mod.clean(p.get("last_agent_message"), 160))
+            elif kind == "event_msg" and ("abort" in ptype or ptype == "turn_aborted"):
+                yield "done", dict(base, outcome="aborted")
+            elif kind == "event_msg" and "approval_request" in ptype:
+                yield "waiting", base
+
+
+def already_seen(upd):
+    try:
+        with open(event_mod.STATE) as f:
+            t = json.load(f)["tasks"].get(upd["id"])
+    except (OSError, ValueError, KeyError):
+        return False
+    return bool(t) and t.get("updated", 0) >= upd["ts"] - 1
+
+
+def emit(event, upd, dry):
+    if dry:
+        print(event, upd.get("id"), time.strftime("%H:%M:%S", time.localtime(upd["ts"])), (upd.get("prompt") or upd.get("reply") or "")[:70])
+        return
+    if event == "prompt":
+        event_mod.apply(upd, "codex", "update")
+    else:
+        event_mod.apply(upd, "codex", event)
+
+
+def main():
+    dry = "--dry" in sys.argv
+    lookback = float(sys.argv[sys.argv.index("--dry") + 1]) * 3600 if dry else LOOKBACK
+    tails = {}
+    while True:
+        now = time.time()
+        for path in glob.glob(os.path.join(SESSIONS, "*/*/*/*.jsonl")):
+            try:
+                if now - os.path.getmtime(path) > lookback:
+                    continue
+            except OSError:
+                continue
+            first = path not in tails
+            if first:
+                tails[path] = Tail(path)
+            tail = tails[path]
+            evs = list(tail.events(tail.read()))
+            if not evs:
+                continue
+            if first and not dry:
+                # Catching up on an existing log: replay only the latest turn, only if recent,
+                # and never re-announce one the board already has (e.g. after a restart).
+                starts = [i for i, (ev, _) in enumerate(evs) if ev == "start"]
+                evs = evs[starts[-1]:] if starts else evs[-1:]
+                if now - evs[-1][1]["ts"] > BACKFILL_RECENT or already_seen(evs[-1][1]):
+                    continue
+            if not tail.name:
+                tail.name = thread_names({tail.thread}).get(tail.thread)  # DB can be briefly locked; retry next time
+            for ev, upd in evs:
+                if tail.name:
+                    upd["name"] = tail.name
+                emit(ev, upd, dry)
+        if dry:
+            return
+        time.sleep(1.5)
+
+
+if __name__ == "__main__":
+    main()

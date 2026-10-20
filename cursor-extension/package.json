@@ -1,0 +1,12 @@
+{
+  "name": "agent-board-jump",
+  "displayName": "Agent Board Jump",
+  "description": "Lets Agent Board bring the right terminal tab to the front when you click a task.",
+  "publisher": "agentboard",
+  "version": "0.0.2",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/achal-walia-1/agent-board" },
+  "engines": { "vscode": "^1.80.0" },
+  "activationEvents": ["onUri", "onStartupFinished"],
+  "main": "./extension.js"
+}

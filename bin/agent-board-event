@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""Record an agent task event into ~/.agent-board/state.json.
+
+Usage:
+  agent-board-event claude start|done|waiting|resume  (hook JSON on stdin)
+  agent-board-event cursor start|done           (hook JSON on stdin)
+  agent-board-event codex done '<json>'          (Codex notify passes JSON as argv)
+
+Never fails loudly: a broken tracker must not break the agent it's hooked into.
+"""
+import fcntl
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~/.agent-board")
+STATE = os.path.join(HOME, "state.json")
+LOCK = os.path.join(HOME, "state.lock")
+LOG = os.path.join(HOME, "events.log")
+MAX_TASKS = 40
+
+
+IMAGE_PATH = re.compile(r"""['"]?(?:/|~/)[^'"\n]*?\.(?:png|jpe?g|gif|webp|heic|pdf|mov|mp4)['"]?""", re.I)
+
+
+def clean(text, limit=220):
+    if not text:
+        return ""
+    text = IMAGE_PATH.sub(" 🖼 ", str(text))
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+FILLER = set("""a an the to of for and or in on at with by from into is are be was this that these those it its
+my me i we you your our us can could would should please just also so then now like want wanted need make do does did
+get give let lets let's hey hi ok okay yeah yes no not there here what how why when which who all any some more too
+very really kindly pls thanks thank go see check right currently tell show help try""".split())
+CLAUDE = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+
+
+def quick_title(prompt):
+    """Instant 3-word stand-in until the model's summary lands."""
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'+.-]*", prompt or "")
+    keep = [w for w in words if w.lower() not in FILLER] or words
+    return " ".join(w if w.isupper() else w.capitalize() for w in keep[:3]) or "New task"
+
+
+def summarize(task_id, prompt):
+    """Background: ask Haiku for a 3-word title, then store it."""
+    ask = ("Summarize this request to an AI assistant in exactly 3 words, Title Case, no punctuation. "
+           "Reply with only the 3 words.\n\nRequest: " + prompt[:700])
+    try:
+        out = subprocess.run([CLAUDE, "-p", "--model", "haiku", ask], capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    title = " ".join(re.sub(r"[^\w\s'&-]", "", out).split()[:4])
+    if not title:
+        return
+    with open(LOCK, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            with open(STATE) as f:
+                state = json.load(f)
+        except (OSError, ValueError):
+            return
+        t = state.get("tasks", {}).get(task_id)
+        if not t or t.get("prompt") != prompt:
+            return  # a newer prompt arrived meanwhile
+        t["title"] = title
+        tmp = STATE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f, indent=1)
+        os.replace(tmp, STATE)
+
+
+def spawn_summary(task_id, prompt):
+    # Titles come from Claude Haiku via your own `claude` CLI. Opt out: touch ~/.agent-board/no-ai-titles
+    if len(prompt.split()) <= 3 or os.path.exists(os.path.join(HOME, "no-ai-titles")) or not os.path.exists(CLAUDE):
+        return
+    subprocess.Popen([sys.executable, os.path.realpath(__file__), "title", task_id, prompt],
+                     env=dict(os.environ, AGENT_BOARD_SKIP="1"), start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def last_claude_reply(transcript_path):
+    """Pull the last assistant text out of a Claude Code transcript (jsonl)."""
+    try:
+        with open(transcript_path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 400_000))
+            lines = f.read().decode("utf-8", "ignore").splitlines()
+        for line in reversed(lines):
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if entry.get("type") != "assistant":
+                continue
+            content = entry.get("message", {}).get("content", [])
+            if isinstance(content, str):
+                return content
+            texts = [c.get("text", "") for c in content if c.get("type") == "text"]
+            if any(texts):
+                return " ".join(texts)
+    except OSError:
+        pass
+    return ""
+
+
+def last_claude_prompt(transcript_path):
+    """Last real user message in a Claude Code transcript (skips tool results and system text)."""
+    try:
+        with open(transcript_path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 800_000))
+            lines = f.read().decode("utf-8", "ignore").splitlines()
+        for line in reversed(lines):
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if entry.get("type") != "user" or entry.get("isMeta"):
+                continue
+            content = entry.get("message", {}).get("content")
+            if isinstance(content, list):
+                content = " ".join(c.get("text", "") for c in content if c.get("type") == "text")
+            if content and not content.lstrip().startswith("<"):
+                return content
+    except OSError:
+        pass
+    return ""
+
+
+def find_terminal():
+    """Walk up the process tree: the terminal's tty (Terminal/iTerm tabs) and the chain of
+    process ids (Cursor's extension matches a terminal tab by its shell's pid)."""
+    pid, tty, chain = os.getppid(), "", []
+    for _ in range(10):
+        try:
+            out = os.popen(f"ps -o ppid=,tty= -p {pid}").read().split()
+        except OSError:
+            break
+        if len(out) < 2:
+            break
+        chain.append(pid)
+        if not tty and out[1] not in ("??", "-"):
+            tty = "/dev/" + out[1]
+        pid = int(out[0])
+        if pid <= 1:
+            break
+    return tty, chain
+
+
+def parse(source, event, payload):
+    """Normalise each tool's hook payload into one task update."""
+    p = payload or {}
+    if source == "claude":
+        cwd = p.get("cwd") or os.getcwd()
+        upd = {"id": "claude:" + str(p.get("session_id", "?")), "cwd": cwd}
+        if event == "start":
+            upd["prompt"] = clean(p.get("prompt"))
+        elif event == "done":
+            reply = p.get("last_assistant_message") or last_claude_reply(p.get("transcript_path", ""))
+            upd["reply"] = clean(reply, 160)
+            upd["fallback_prompt"] = clean(last_claude_prompt(p.get("transcript_path", "")))
+        elif event == "waiting":
+            upd["reply"] = clean(p.get("message"), 160)
+        return upd
+    if source == "claudeapp":
+        # Claude desktop app, reported by the accessibility helper (AgentBoardAX)
+        chat = clean(p.get("chat") or "Claude chat", 120)
+        upd = {"id": "claudeapp:" + chat, "cwd": "", "name": chat}
+        if event == "start":
+            upd["prompt"] = chat
+        return upd
+    if source == "cursor":
+        roots = p.get("workspace_roots") or []
+        upd = {"id": "cursor:" + str(p.get("conversation_id", "?")), "cwd": roots[0] if roots else ""}
+        if event == "start":
+            upd["prompt"] = clean(p.get("prompt"))
+        if event == "done" and p.get("status") in ("aborted", "error"):
+            upd["outcome"] = p["status"]
+        return upd
+    if source == "codex":
+        msgs = p.get("input-messages") or []
+        upd = {
+            "id": "codex:" + str(p.get("thread-id") or p.get("turn-id") or "?"),
+            "cwd": p.get("cwd", ""),
+            "reply": clean(p.get("last-assistant-message"), 160),
+            "thread": str(p.get("thread-id") or ""),
+        }
+        if msgs:
+            upd["prompt"] = clean(msgs[-1])
+        return upd
+    return None
+
+
+def apply(upd, source, event):
+    os.makedirs(HOME, exist_ok=True)
+    with open(LOCK, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            with open(STATE) as f:
+                state = json.load(f)
+        except (OSError, ValueError):
+            state = {"tasks": {}}
+        tasks = state.setdefault("tasks", {})
+        now = upd.get("ts") or time.time()  # watchers pass the event's own time
+        if event == "resume" and tasks.get(upd["id"], {}).get("status") != "waiting":
+            return  # fires on every tool call; only act when unblocking a waiting task
+        t = tasks.get(upd["id"], {"source": source, "started": now, "prompt": ""})
+        new_prompt = upd.get("prompt") or (upd.get("fallback_prompt") if not t.get("prompt") else "")
+        if new_prompt and new_prompt != t.get("prompt"):
+            t["title"] = quick_title(new_prompt)
+        else:
+            new_prompt = ""
+        for k in ("cwd", "prompt", "reply", "outcome", "thread", "name"):
+            if upd.get(k):
+                t[k] = upd[k]
+        if not t.get("prompt") and upd.get("fallback_prompt"):
+            t["prompt"] = upd["fallback_prompt"]
+        if source == "claude" and event in ("start", "waiting", "done") and not t.get("pids"):
+            t["tty"], t["pids"] = find_terminal()
+        t["project"] = os.path.basename((t.get("cwd") or "").rstrip("/")) or "~"
+        t["term"] = os.environ.get("TERM_PROGRAM", t.get("term", ""))
+        # Inside Herdr (terminal multiplexer): remember the pane so a click can focus it.
+        herdr = {k: v for k, v in os.environ.items() if k.startswith("HERDR_") and len(v) < 300}
+        if herdr.get("HERDR_PANE_ID"):
+            t["herdr"] = herdr
+        if event == "start":
+            t.update(status="running", started=now, seen=False, reply="", outcome="")
+        elif event == "done":
+            t.update(status="done", finished=now, seen=False)
+        elif event == "waiting":
+            t.update(status="waiting", seen=False)
+        elif event == "resume":
+            t.update(status="running", reply="")
+        t["updated"] = now
+        tasks[upd["id"]] = t
+        # Keep the newest MAX_TASKS, drop seen ones older than 12h.
+        keep = sorted(tasks.items(), key=lambda kv: kv[1].get("updated", 0), reverse=True)[:MAX_TASKS]
+        state["tasks"] = {
+            k: v for k, v in keep
+            if not (v.get("seen") and now - v.get("updated", 0) > 12 * 3600)
+        }
+        tmp = STATE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f, indent=1)
+        os.replace(tmp, STATE)
+    if new_prompt:
+        spawn_summary(upd["id"], new_prompt)
+
+
+def main():
+    if len(sys.argv) < 3:
+        return
+    if sys.argv[1] == "title" and len(sys.argv) > 3:
+        summarize(sys.argv[2], sys.argv[3])
+        return
+    if os.environ.get("AGENT_BOARD_SKIP"):
+        return  # our own background `claude -p` calls
+    source, event = sys.argv[1], sys.argv[2]
+    raw = sys.argv[3] if len(sys.argv) > 3 else ("" if sys.stdin.isatty() else sys.stdin.read())
+    try:
+        payload = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        payload = {}
+    if source == "codex" and payload.get("type") not in (None, "agent-turn-complete"):
+        return
+    upd = parse(source, event, payload)
+    if upd:
+        apply(upd, source, event)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:  # noqa: BLE001
+        try:
+            with open(LOG, "a") as f:
+                f.write(f"{time.ctime()} {sys.argv[1:3]} error: {e}\n")
+        except OSError:
+            pass
+    # Cursor hooks expect a JSON reply on stdout.
+    if len(sys.argv) > 2 and sys.argv[1] == "cursor":
+        print(json.dumps({"continue": True} if sys.argv[2] == "start" else {}))
