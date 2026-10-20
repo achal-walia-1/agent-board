@@ -1336,6 +1336,12 @@ struct Rail: View {
     }
 }
 
+/// Act on the first click even when another app is in front. Without this, the click after a jump
+/// (which hands focus to Terminal, Cursor or Codex) only "wakes" the board and is otherwise ignored.
+final class FirstClickHostingView<Content: View>: NSHostingView<Content> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
 struct SizeKey: PreferenceKey {
     static var defaultValue: CGSize = .zero
     static func reduce(value: inout CGSize, nextValue: () -> CGSize) { value = nextValue() }
@@ -1367,7 +1373,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         store.onResize = { [weak self] s in DispatchQueue.main.async { self?.resize(to: s) } }
         let root = Board(store: store)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-        panel.contentView = NSHostingView(rootView: root)
+        panel.contentView = FirstClickHostingView(rootView: root)
 
         if !panel.setFrameUsingName("AgentBoard2"), let screen = NSScreen.main?.visibleFrame {
             panel.setFrameTopLeftPoint(NSPoint(x: screen.maxX - 420, y: screen.maxY - 4))
