@@ -23,6 +23,8 @@ A Doberman lives in the corner and acts out the mood: typing hard at a laptop wh
 
 Each task shows the app icon, a three-word summary of what you asked, and its status: **In progress**, **Ready**, **Approve** or **Done**. You get a chime when something finishes.
 
+**One row per conversation window.** Keep chatting in the same terminal tab, Herdr pane, Codex thread or Cursor chat and its row just updates, even after `/clear`. Background `claude -p` runs (scripts, pipelines, subagents) never get rows or overwrite yours.
+
 ## Two views
 
 Hover the card and click the sidebar icon to switch to a slim **side rail** that sits on the right edge of your screen. Hover the rail and the task list slides out to the left. The small card icon at the bottom of the rail switches back.

@@ -156,12 +156,30 @@ def find_terminal():
     return tty, chain
 
 
+def window_of(state, session):
+    """Where a Claude Code session lives, so every session in the same Herdr pane or terminal tab
+    (including after /clear) updates one row. Remembered per session, so the process walk runs once."""
+    sessions = state.setdefault("sessions", {})
+    if session not in sessions:
+        pane = os.environ.get("HERDR_PANE_ID")
+        if pane:
+            loc = "herdr:" + pane
+        else:
+            tty, _ = find_terminal()
+            loc = ("tty:" + tty) if tty else ("session:" + session)  # no terminal: e.g. an editor panel
+        sessions[session] = loc
+        for old in list(sessions)[:-300]:  # keep the map small
+            sessions.pop(old)
+    return sessions[session]
+
+
 def parse(source, event, payload):
     """Normalise each tool's hook payload into one task update."""
     p = payload or {}
     if source == "claude":
         cwd = p.get("cwd") or os.getcwd()
-        upd = {"id": "claude:" + str(p.get("session_id", "?")), "cwd": cwd}
+        # the row id is resolved in apply(): one row per window (Herdr pane / terminal tab), not per session
+        upd = {"id": "", "session": str(p.get("session_id", "?")), "cwd": cwd}
         if event == "start":
             upd["prompt"] = clean(p.get("prompt"))
         elif event == "done":
@@ -211,6 +229,8 @@ def apply(upd, source, event):
             state = {"tasks": {}}
         tasks = state.setdefault("tasks", {})
         now = upd.get("ts") or time.time()  # watchers pass the event's own time
+        if source == "claude":
+            upd["id"] = "claude:" + window_of(state, upd.pop("session"))
         if event == "resume" and tasks.get(upd["id"], {}).get("status") != "waiting":
             return  # fires on every tool call; only act when unblocking a waiting task
         t = tasks.get(upd["id"], {"source": source, "started": now, "prompt": ""})
@@ -264,6 +284,8 @@ def main():
         return
     if os.environ.get("AGENT_BOARD_SKIP"):
         return  # our own background `claude -p` calls
+    if os.environ.get("CLAUDE_CODE_ENTRYPOINT", "").startswith("sdk"):
+        return  # scripted/background `claude -p` runs (pipelines, subagents): not a conversation window
     source, event = sys.argv[1], sys.argv[2]
     raw = sys.argv[3] if len(sys.argv) > 3 else ("" if sys.stdin.isatty() else sys.stdin.read())
     try:
